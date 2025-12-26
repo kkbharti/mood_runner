@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Mood Runner</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+<style>
+body{margin:0;overflow:hidden;font-family:system-ui;background:#000}
+#ui{position:absolute;top:2vh;left:3vw;color:#fff;z-index:10}
+#ui div{font-size:2vh}
+#mood{font-size:5vh}
+
+#controls{
+ position:absolute;top:2vh;right:3vw;z-index:10;
+ background:rgba(0,0,0,.45);padding:1vh;border-radius:8px
+}
+.control{display:flex;align-items:center;margin-bottom:.5vh}
+input[type=range]{width:100px;margin-left:6px}
+button{font-size:2vh;padding:.4vh 1vh;margin-left:6px}
+
+#overlay{
+ position:absolute;inset:0;background:rgba(0,0,0,.85);
+ display:flex;align-items:center;justify-content:center;
+ flex-direction:column;color:white;z-index:20;text-align:center
+}
+</style>
+
+<script type="importmap">
+{
+ "imports":{
+  "three":"https://unpkg.com/three@0.158.0/build/three.module.js",
+  "three/addons/":"https://unpkg.com/three@0.158.0/examples/jsm/"
+ }
+}
+</script>
+</head>
+
+<body>
+
+<!-- UI -->
+<div id="ui">
+ <div id="mood">😄</div>
+ <div id="score">0 m</div>
+ <div id="best">Best: 0 m</div>
+ <div id="miss">Miss: 0 / 10</div>
+ <div id="danger">Red Hits: 0 / 3</div>
+</div>
+
+<!-- CONTROLS -->
+<div id="controls">
+ <div class="control">🎵
+  <input id="musicVol" type="range" min="0" max="1" step="0.05" value="0.4">
+ </div>
+ <div class="control">💥
+  <input id="fxVol" type="range" min="0" max="1" step="0.05" value="0.3">
+ </div>
+ <div class="control">
+  <button id="muteBtn">🔇</button>
+  <button id="pauseBtn">⏸</button>
+  <button id="restartBtn">🔄</button>
+ </div>
+</div>
+
+<!-- START SCREEN -->
+<div id="overlay">
+ <h1>MOOD RUNNER</h1>
+ <p>
+ 🔴 Avoid red obstacles<br>
+ 🟢 Hit all other obstacles<br><br>
+ ❌ 10 misses OR 3 red hits = Game Over
+ </p>
+ <button id="startBtn">START</button>
+</div>
+
+<!-- BACKGROUND MUSIC -->
+<audio id="bgMusic" src="assets/game_background.mp3" loop></audio>
+
+<script type="module">
+import * as THREE from "three";
+import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
+
+/* ================= AUDIO ================= */
+const AudioCtx=window.AudioContext||window.webkitAudioContext;
+const audioCtx=new AudioCtx();
+
+const bgMusic=document.getElementById("bgMusic");
+
+let musicVolume=0.4;
+let fxVolume=0.3;
+let muted=false;
+
+bgMusic.volume=musicVolume;
+
+function fadeMusic(target,duration=800){
+ const step=(target-bgMusic.volume)/20;
+ let i=0;
+ const t=setInterval(()=>{
+  bgMusic.volume=Math.max(0,Math.min(1,bgMusic.volume+step));
+  if(++i>=20){bgMusic.volume=target;clearInterval(t);}
+ },duration/20);
+}
+
+function playFX(freq=400){
+ if(muted)return;
+ const o=audioCtx.createOscillator();
+ const g=audioCtx.createGain();
+ g.gain.value=fxVolume;
+ o.frequency.value=freq;
+ o.connect(g).connect(audioCtx.destination);
+ o.start();
+ o.stop(audioCtx.currentTime+0.08);
+}
+
+/* ================= UI ================= */
+const scoreUI=score,bestUI=best,missUI=miss,dangerUI=danger;
+let bestScore=Number(localStorage.getItem("bestScore")||0);
+bestUI.textContent="Best: "+bestScore+" m";
+
+/* ================= THREE ================= */
+const scene=new THREE.Scene();
+scene.background=new THREE.Color(0x87ceeb);
+
+const camera=new THREE.PerspectiveCamera(60,innerWidth/innerHeight,.1,1000);
+camera.position.set(0,2.8,-4.8);
+
+const renderer=new THREE.WebGLRenderer({antialias:true});
+renderer.setSize(innerWidth,innerHeight);
+renderer.shadowMap.enabled=true;
+document.body.appendChild(renderer.domElement);
+
+const sun=new THREE.DirectionalLight(0xffffff,1.2);
+sun.position.set(5,10,5);
+sun.castShadow=true;
+scene.add(sun);
+scene.add(new THREE.AmbientLight(0xffffff,.6));
+
+/* ================= ROAD ================= */
+const roadPieces=[];
+let rz=0;
+function spawnRoad(){
+ const g=new THREE.Group();
+ const road=new THREE.Mesh(
+  new THREE.BoxGeometry(6,.2,10),
+  new THREE.MeshStandardMaterial({color:0x444444})
+ );
+ road.receiveShadow=true;
+ g.add(road);
+ for(let x of[-1,1]){
+  const l=new THREE.Mesh(
+   new THREE.BoxGeometry(.1,.01,10),
+   new THREE.MeshStandardMaterial({color:0xffffff})
+  );
+  l.position.set(x,.11,0);
+  g.add(l);
+ }
+ g.position.z=rz;
+ scene.add(g);
+ roadPieces.push(g);
+ rz+=10;
+}
+for(let i=0;i<6;i++)spawnRoad();
+
+/* ================= PLAYER ================= */
+let runner,mixer,modelReady=false;
+const clock=new THREE.Clock();
+
+new GLTFLoader().load("assets/cream_the_rabbit_rigged.glb",g=>{
+ runner=g.scene;
+ runner.scale.set(.45,.45,.45);
+ runner.position.y=.1;
+ runner.traverse(o=>o.castShadow=true);
+ scene.add(runner);
+
+ if(g.animations.length){
+  mixer=new THREE.AnimationMixer(runner);
+  mixer.clipAction(g.animations[0]).play();
+ }
+ modelReady=true;
+});
+
+/* ================= PARTICLES ================= */
+function burst(color,pos){
+ const geo=new THREE.BufferGeometry(),a=[];
+ for(let i=0;i<14;i++)
+  a.push(pos.x+(Math.random()-.5),pos.y+Math.random(),pos.z+(Math.random()-.5));
+ geo.setAttribute("position",new THREE.Float32BufferAttribute(a,3));
+ const p=new THREE.Points(geo,new THREE.PointsMaterial({color,size:.15}));
+ scene.add(p);
+ setTimeout(()=>scene.remove(p),300);
+}
+
+/* ================= GAME STATE ================= */
+let started=false,paused=false,gameOver=false;
+let lane=0,speed=.15,distance=0,lastSpeedStep=0;
+let missCount=0,redHits=0;
+
+/* ================= INPUT ================= */
+addEventListener("keydown",e=>{
+ if(e.key==="ArrowLeft")lane--;
+ if(e.key==="ArrowRight")lane++;
+ lane=Math.max(-1,Math.min(1,lane));
+});
+
+/* ================= BUTTONS ================= */
+startBtn.onclick=async()=>{
+ if(!modelReady)return alert("Loading...");
+ await audioCtx.resume();
+ bgMusic.currentTime=0;
+ bgMusic.play();
+ fadeMusic(musicVolume);
+ started=true;
+ overlay.style.display="none";
+};
+
+pauseBtn.onclick=()=>{
+ paused=!paused;
+ paused?fadeMusic(0):fadeMusic(musicVolume);
+};
+
+restartBtn.onclick=()=>location.reload();
+
+musicVol.oninput=()=>{musicVolume=Number(musicVol.value);if(!muted)bgMusic.volume=musicVolume};
+fxVol.oninput=()=>fxVolume=Number(fxVol.value);
+
+muteBtn.onclick=()=>{
+ muted=!muted;
+ muteBtn.textContent=muted?"🔈":"🔇";
+ muted?fadeMusic(0):fadeMusic(musicVolume);
+};
+
+/* ================= GAME OVER ================= */
+function endGame(){
+ gameOver=true;
+ fadeMusic(0);
+ setTimeout(()=>{bgMusic.pause();bgMusic.currentTime=0},800);
+
+ let msg="GAME OVER";
+ if(distance>bestScore){
+  bestScore=Math.floor(distance);
+  localStorage.setItem("bestScore",bestScore);
+  msg="🎉 NEW HIGH SCORE 🎉";
+ }
+ overlay.innerHTML=`<h1>${msg}</h1><button onclick="location.reload()">Restart</button>`;
+ overlay.style.display="flex";
+}
+
+/* ================= LOOP ================= */
+const camTarget=new THREE.Vector3();
+let frame=0;
+
+function animate(){
+ requestAnimationFrame(animate);
+ if(!started||paused||gameOver||!runner){renderer.render(scene,camera);return;}
+
+ runner.position.z+=speed;
+ runner.position.x+=(lane*2-runner.position.x)*.12;
+
+ camera.position.z=runner.position.z-4.8;
+ camTarget.copy(runner.position);camTarget.y+=1;
+ camera.lookAt(camTarget);
+
+ distance+=speed;
+ scoreUI.textContent=Math.floor(distance)+" m";
+
+ if(distance<3000&&distance-lastSpeedStep>=250){
+  speed*=1.2;
+  lastSpeedStep=distance;
+ }
+
+ roadPieces.forEach(r=>{
+  if(r.position.z<runner.position.z-10)r.position.z+=60;
+ });
+
+ if(frame%120===0){
+  const danger=Math.random()<0.25;
+  const o=new THREE.Mesh(
+   new THREE.BoxGeometry(1,danger?1.5:1,1),
+   new THREE.MeshStandardMaterial({color:danger?0xaa0000:0x33cc66})
+  );
+  o.userData.danger=danger;
+  o.position.set([-2,0,2][Math.floor(Math.random()*3)],.75,runner.position.z+30);
+  scene.add(o);
+  obstacles.push(o);
+ }
+
+ obstacles.forEach((o,i)=>{
+  const dz=o.position.z-runner.position.z;
+  const dx=Math.abs(o.position.x-runner.position.x);
+
+  if(Math.abs(dz)<.8&&dx<.8){
+   if(o.userData.danger){
+    redHits++;dangerUI.textContent=`Red Hits: ${redHits} / 3`;
+    playFX(120);burst(0xff0000,o.position);
+    if(redHits>=3)return endGame();
+   }else{
+    playFX(600);burst(0x00ff00,o.position);
+   }
+   scene.remove(o);obstacles.splice(i,1);
+  }
+
+  if(dz<-1){
+   if(!o.userData.danger){
+    missCount++;missUI.textContent=`Miss: ${missCount} / 10`;
+    if(missCount>=10)return endGame();
+   }
+   scene.remove(o);obstacles.splice(i,1);
+  }
+ });
+
+ if(mixer)mixer.update(clock.getDelta());
+ renderer.render(scene,camera);
+ frame++;
+}
+const obstacles=[];
+animate();
+</script>
+</body>
+</html>
